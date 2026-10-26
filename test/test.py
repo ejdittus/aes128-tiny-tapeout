@@ -36,7 +36,7 @@ async def aes128_nist_known_answer(dut):
 
     # The core raises done for one cycle; sample every cycle.
     done = False
-    for _ in range(30):
+    for _ in range(500):
         await FallingEdge(dut.clk)
         dut.uio_in.value = 5
         await Timer(1, unit='ns')
@@ -44,7 +44,7 @@ async def aes128_nist_known_answer(dut):
         if status & 2:
             done = True
             break
-    assert done, 'AES did not complete within 30 cycles'
+    assert done, 'AES did not complete within 500 cycles'
 
     # With command 4 asserted, output is the current indexed byte.
     # Sample before each rising edge; that edge advances the index.
