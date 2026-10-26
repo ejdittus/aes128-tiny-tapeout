@@ -181,34 +181,6 @@ module aes128_core (
         end
     end
 
-    // AES S-box: multiplicative inverse in GF(2^8), followed by the
-    // standard affine transformation. The loops have fixed bounds.
-    function automatic [7:0] aes_sbox;
-        input [7:0] a;
-        reg [7:0] base;
-        reg [7:0] result;
-        reg [7:0] exponent;
-        reg [7:0] x;
-        integer i;
-        begin
-            base = a;
-            result = 8'h01;
-            exponent = 8'd254;
-            for (i = 0; i < 8; i = i + 1) begin
-                if (exponent[i])
-                    result = gf_mul(result, base);
-                base = gf_mul(base, base);
-            end
-            x = result;
-            aes_sbox = x
-                     ^ {x[6:0], x[7]}
-                     ^ {x[5:0], x[7:6]}
-                     ^ {x[4:0], x[7:5]}
-                     ^ {x[3:0], x[7:4]}
-                     ^ 8'h63;
-        end
-    endfunction
-
     // AES-128 forward S-box lookup table.
     function automatic [7:0] aes_sbox;
         input [7:0] a;
