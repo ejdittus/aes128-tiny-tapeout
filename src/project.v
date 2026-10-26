@@ -161,7 +161,7 @@ module aes128_core (
             done <= 1'b0;
 
             if (start && !busy) begin
-                state_reg <= plaintext;
+                state_reg <= plaintext ^ key;
                 round_key <= key;
                 round_num <= 4'd1;
                 busy      <= 1'b1;
