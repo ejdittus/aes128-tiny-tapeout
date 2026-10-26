@@ -447,6 +447,27 @@ module aes128_core (
         end
     endfunction
 
+    function automatic [127:0] sub_bytes_shift_rows;
+        input [127:0] state_in;
+        reg [127:0] result;
+        integer i;
+        integer row;
+        integer col;
+        integer source_index;
+        begin
+            result = 128'h0;
+            // AES state is represented column-major: byte index = 4*col+row.
+            for (i = 0; i < 16; i = i + 1) begin
+                col = i / 4;
+                row = i % 4;
+                source_index = 4 * ((col + row) % 4) + row;
+                result[127 - (i * 8) -: 8] =
+                    aes_sbox(state_in[127 - (source_index * 8) -: 8]);
+            end
+            sub_bytes_shift_rows = result;
+        end
+    endfunction
+
     function automatic [7:0] xtime;
         input [7:0] a;
         begin
@@ -528,4 +549,3 @@ module aes128_core (
 endmodule
 
 `default_nettype wire
-
