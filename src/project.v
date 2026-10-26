@@ -124,6 +124,7 @@ module tt_um_aes128 (
 endmodule
 
 
+
 module aes128_core (
     input  wire         clk,
     input  wire         rst_n,
@@ -134,54 +135,170 @@ module aes128_core (
     output reg          busy,
     output reg          done
 );
+    // One shared S-box, used for both key expansion and SubBytes.
+    // Each AES round takes 4 key S-box cycles, 1 key-update cycle,
+    // 16 SubBytes/ShiftRows cycles, and 4 MixColumns/AddRoundKey cycles.
+    localparam [2:0] IDLE = 3'd0,
+                     KEY_SBOX = 3'd1,
+                     KEY_UPDATE = 3'd2,
+                     SUB_SHIFT = 3'd3,
+                     COLUMN = 3'd4;
 
+    reg [2:0] phase;
+    reg [3:0] index;
+    reg [3:0] round_num;
     reg [127:0] state_reg;
     reg [127:0] round_key;
-    reg [3:0] round_num;
+    reg [127:0] sub_state;
+    reg [31:0] gword;
 
-    wire [127:0] next_round_key;
-    wire [127:0] sub_shift_state;
-    wire [127:0] round_state;
+    wire [31:0] w0 = round_key[127:96] ^ gword;
+    wire [31:0] w1 = round_key[95:64] ^ w0;
+    wire [31:0] w2 = round_key[63:32] ^ w1;
+    wire [31:0] w3 = round_key[31:0] ^ w2;
+    wire [127:0] expanded_key = {w0, w1, w2, w3};
 
-    assign next_round_key = expand_key(round_key, round_num);
-    assign sub_shift_state = sub_bytes_shift_rows(state_reg);
-    assign round_state =
-        ((round_num == 4'd10) ? sub_shift_state : mix_columns(sub_shift_state))
-        ^ next_round_key;
+    // Output-byte index encodes {column, row}.
+    // ShiftRows reads input from column (column + row) modulo 4.
+    wire [1:0] source_column = index[3:2] + index[1:0];
+    wire [3:0] source_index = {source_column, index[1:0]};
+
+    reg [7:0] sbox_input;
+    always @* begin
+        sbox_input = 8'h00;
+        if (phase == KEY_SBOX) begin
+            case (index[1:0])
+                2'd0: sbox_input = round_key[23:16];
+                2'd1: sbox_input = round_key[15:8];
+                2'd2: sbox_input = round_key[7:0];
+                default: sbox_input = round_key[31:24];
+            endcase
+        end else if (phase == SUB_SHIFT) begin
+            sbox_input = state_reg[127 - 8*source_index -: 8];
+        end
+    end
+    wire [7:0] sbox_output = aes_sbox(sbox_input);
+
+    function automatic [7:0] round_constant;
+        input [3:0] r;
+        begin
+            case (r)
+                4'd1:  round_constant = 8'h01;
+                4'd2:  round_constant = 8'h02;
+                4'd3:  round_constant = 8'h04;
+                4'd4:  round_constant = 8'h08;
+                4'd5:  round_constant = 8'h10;
+                4'd6:  round_constant = 8'h20;
+                4'd7:  round_constant = 8'h40;
+                4'd8:  round_constant = 8'h80;
+                4'd9:  round_constant = 8'h1b;
+                4'd10: round_constant = 8'h36;
+                default: round_constant = 8'h00;
+            endcase
+        end
+    endfunction
+
+    function automatic [7:0] xtime;
+        input [7:0] x;
+        begin
+            xtime = {x[6:0], 1'b0} ^ (x[7] ? 8'h1b : 8'h00);
+        end
+    endfunction
+
+    // MixColumns on one 32-bit column per cycle.
+    function automatic [31:0] mix_column;
+        input [31:0] c;
+        reg [7:0] a, b, d, e, t;
+        begin
+            a = c[31:24];
+            b = c[23:16];
+            d = c[15:8];
+            e = c[7:0];
+            t = a ^ b ^ d ^ e;
+            mix_column = {
+                a ^ t ^ xtime(a ^ b),
+                b ^ t ^ xtime(b ^ d),
+                d ^ t ^ xtime(d ^ e),
+                e ^ t ^ xtime(e ^ a)
+            };
+        end
+    endfunction
+
+    wire [31:0] selected_column = sub_state[127 - 32*index[1:0] -: 32];
+    wire [31:0] transformed_column =
+        (round_num == 4'd10) ? selected_column : mix_column(selected_column);
+    wire [31:0] output_column =
+        transformed_column ^ round_key[127 - 32*index[1:0] -: 32];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state_reg  <= 128'h0;
-            round_key  <= 128'h0;
-            ciphertext <= 128'h0;
-            round_num  <= 4'd0;
-            busy       <= 1'b0;
-            done       <= 1'b0;
+            phase <= IDLE;
+            index <= 4'd0;
+            round_num <= 4'd0;
+            state_reg <= 128'd0;
+            round_key <= 128'd0;
+            sub_state <= 128'd0;
+            gword <= 32'd0;
+            ciphertext <= 128'd0;
+            busy <= 1'b0;
+            done <= 1'b0;
         end else begin
             done <= 1'b0;
-
-            if (start && !busy) begin
-                state_reg <= plaintext ^ key;
-                round_key <= key;
-                round_num <= 4'd1;
-                busy      <= 1'b1;
-            end else if (busy) begin
-                state_reg <= round_state;
-                round_key <= next_round_key;
-
-                if (round_num == 4'd10) begin
-                    ciphertext <= round_state;
-                    busy       <= 1'b0;
-                    done       <= 1'b1;
-                    round_num  <= 4'd0;
-                end else begin
-                    round_num <= round_num + 1'b1;
+            case (phase)
+                IDLE: begin
+                    if (start) begin
+                        state_reg <= plaintext ^ key; // initial AddRoundKey
+                        round_key <= key;
+                        round_num <= 4'd1;
+                        index <= 4'd0;
+                        busy <= 1'b1;
+                        phase <= KEY_SBOX;
+                    end
                 end
-            end
+                KEY_SBOX: begin
+                    gword[31 - 8*index[1:0] -: 8] <=
+                        sbox_output ^
+                        ((index == 4'd0) ? round_constant(round_num) : 8'h00);
+                    if (index == 4'd3) begin
+                        index <= 4'd0;
+                        phase <= KEY_UPDATE;
+                    end else
+                        index <= index + 1'b1;
+                end
+                KEY_UPDATE: begin
+                    round_key <= expanded_key;
+                    index <= 4'd0;
+                    phase <= SUB_SHIFT;
+                end
+                SUB_SHIFT: begin
+                    sub_state[127 - 8*index -: 8] <= sbox_output;
+                    if (index == 4'd15) begin
+                        index <= 4'd0;
+                        phase <= COLUMN;
+                    end else
+                        index <= index + 1'b1;
+                end
+                COLUMN: begin
+                    state_reg[127 - 32*index[1:0] -: 32] <= output_column;
+                    ciphertext[127 - 32*index[1:0] -: 32] <= output_column;
+                    if (index == 4'd3) begin
+                        index <= 4'd0;
+                        if (round_num == 4'd10) begin
+                            busy <= 1'b0;
+                            done <= 1'b1;
+                            phase <= IDLE;
+                        end else begin
+                            round_num <= round_num + 1'b1;
+                            phase <= KEY_SBOX;
+                        end
+                    end else
+                        index <= index + 1'b1;
+                end
+                default: phase <= IDLE;
+            endcase
         end
     end
 
-    // AES-128 forward S-box lookup table.
     function automatic [7:0] aes_sbox;
         input [7:0] a;
         begin
@@ -446,106 +563,6 @@ module aes128_core (
             endcase
         end
     endfunction
-
-    function automatic [127:0] sub_bytes_shift_rows;
-        input [127:0] state_in;
-        reg [127:0] result;
-        integer i;
-        integer row;
-        integer col;
-        integer source_index;
-        begin
-            result = 128'h0;
-            // AES state is represented column-major: byte index = 4*col+row.
-            for (i = 0; i < 16; i = i + 1) begin
-                col = i / 4;
-                row = i % 4;
-                source_index = 4 * ((col + row) % 4) + row;
-                result[127 - (i * 8) -: 8] =
-                    aes_sbox(state_in[127 - (source_index * 8) -: 8]);
-            end
-            sub_bytes_shift_rows = result;
-        end
-    endfunction
-
-    function automatic [7:0] xtime;
-        input [7:0] a;
-        begin
-            if (a[7])
-                xtime = (a << 1) ^ 8'h1b;
-            else
-                xtime = a << 1;
-        end
-    endfunction
-
-    function automatic [127:0] mix_columns;
-        input [127:0] state_in;
-        reg [127:0] result;
-        reg [7:0] a0;
-        reg [7:0] a1;
-        reg [7:0] a2;
-        reg [7:0] a3;
-        integer c;
-        begin
-            result = 128'h0;
-            for (c = 0; c < 4; c = c + 1) begin
-                a0 = state_in[127 - ((4*c+0)*8) -: 8];
-                a1 = state_in[127 - ((4*c+1)*8) -: 8];
-                a2 = state_in[127 - ((4*c+2)*8) -: 8];
-                a3 = state_in[127 - ((4*c+3)*8) -: 8];
-
-                result[127 - ((4*c+0)*8) -: 8] =
-                    xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3;
-                result[127 - ((4*c+1)*8) -: 8] =
-                    a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3;
-                result[127 - ((4*c+2)*8) -: 8] =
-                    a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3);
-                result[127 - ((4*c+3)*8) -: 8] =
-                    (xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3);
-            end
-            mix_columns = result;
-        end
-    endfunction
-
-    function automatic [127:0] expand_key;
-        input [127:0] key_in;
-        input [3:0] round_in;
-        reg [7:0] rcon;
-        reg [31:0] temp;
-        reg [31:0] w0;
-        reg [31:0] w1;
-        reg [31:0] w2;
-        reg [31:0] w3;
-        begin
-            case (round_in)
-                4'd1:  rcon = 8'h01;
-                4'd2:  rcon = 8'h02;
-                4'd3:  rcon = 8'h04;
-                4'd4:  rcon = 8'h08;
-                4'd5:  rcon = 8'h10;
-                4'd6:  rcon = 8'h20;
-                4'd7:  rcon = 8'h40;
-                4'd8:  rcon = 8'h80;
-                4'd9:  rcon = 8'h1b;
-                4'd10: rcon = 8'h36;
-                default: rcon = 8'h00;
-            endcase
-
-            temp = {
-                aes_sbox(key_in[23:16]) ^ rcon,
-                aes_sbox(key_in[15:8]),
-                aes_sbox(key_in[7:0]),
-                aes_sbox(key_in[31:24])
-            };
-
-            w0 = key_in[127:96] ^ temp;
-            w1 = key_in[95:64]  ^ w0;
-            w2 = key_in[63:32]  ^ w1;
-            w3 = key_in[31:0]   ^ w2;
-            expand_key = {w0, w1, w2, w3};
-        end
-    endfunction
-
 endmodule
 
 `default_nettype wire
