@@ -13,9 +13,14 @@
 //   uio_in = 8'h04: read one ciphertext byte from uo_out (16 bytes, MSB first)
 //   uio_in = 8'h05: read status on uo_out; bit 0 = busy, bit 1 = done
 //
-// Ciphertext output is read one byte at a time with command 8'h04.
+// Load, start and read commands are ignored while encryption is busy.
 // This is an educational synthesizable implementation. Run the Tiny Tapeout
 // synthesis/physical-design flow to determine whether it fits the chosen tile.
+//
+// To save area, the key and the AES state are byte-wide shift registers:
+// key and plaintext bytes are shifted in, and the ciphertext is read by
+// rotating the state one byte per read (16 reads restore it). The state
+// register holds the plaintext, the round state and the ciphertext.
 
 `default_nettype none
 
@@ -36,121 +41,37 @@ module tt_um_aes128 (
     localparam [7:0] CMD_READ_CT    = 8'h04;
     localparam [7:0] CMD_STATUS     = 8'h05;
 
-    reg [127:0] key_reg;
-    reg [127:0] plaintext_reg;
-    reg [3:0] key_index;
-    reg [3:0] pt_index;
-    reg [3:0] ct_index;
-    reg start_reg;
+    // One shared S-box, used for both key expansion and SubBytes.
+    // Each AES round takes 4 key S-box cycles, 1 key-update cycle,
+    // 16 SubBytes cycles, 1 ShiftRows cycle, and 4 MixColumns/AddRoundKey
+    // cycles.
+    localparam [2:0] IDLE = 3'd0,
+                     KEY_SBOX = 3'd1,
+                     KEY_UPDATE = 3'd2,
+                     SUB_BYTES = 3'd3,
+                     SHIFT_ROWS = 3'd4,
+                     COLUMN = 3'd5;
 
-    wire [127:0] ciphertext;
-    wire busy;
-    wire done;
+    reg [127:0] key_reg;
+    reg [127:0] state_reg;
+    reg [127:0] round_key;
+    reg [31:0] gword;
+    reg [2:0] phase;
+    reg [3:0] index;
+    reg [3:0] round_num;
+    reg busy;
+    reg done;
 
     assign uio_out = 8'h00;
     assign uio_oe  = 8'h00; // Bidirectional pins are inputs.
 
-    aes128_core core (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .start      (start_reg),
-        .key         (key_reg),
-        .plaintext   (plaintext_reg),
-        .ciphertext  (ciphertext),
-        .busy        (busy),
-        .done        (done)
-    );
-
     always @* begin
-        uo_out = 8'h00;
         case (uio_in)
-            CMD_READ_CT: uo_out = ciphertext[127 - (ct_index * 8) -: 8];
+            CMD_READ_CT: uo_out = state_reg[127:120];
             CMD_STATUS:  uo_out = {6'b000000, done, busy};
             default:     uo_out = 8'h00;
         endcase
     end
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            key_reg       <= 128'h0;
-            plaintext_reg <= 128'h0;
-            key_index     <= 4'd0;
-            pt_index      <= 4'd0;
-            ct_index      <= 4'd0;
-            start_reg     <= 1'b0;
-        end else begin
-            start_reg <= 1'b0;
-
-            case (uio_in)
-                CMD_LOAD_KEY: begin
-                    key_reg[127 - (key_index * 8) -: 8] <= ui_in;
-                    if (key_index == 4'd15)
-                        key_index <= 4'd0;
-                    else
-                        key_index <= key_index + 1'b1;
-                end
-
-                CMD_LOAD_PT: begin
-                    plaintext_reg[127 - (pt_index * 8) -: 8] <= ui_in;
-                    if (pt_index == 4'd15)
-                        pt_index <= 4'd0;
-                    else
-                        pt_index <= pt_index + 1'b1;
-                end
-
-                CMD_START: begin
-                    start_reg <= 1'b1;
-                    ct_index  <= 4'd0;
-                end
-
-                CMD_READ_CT: begin
-                    if (ct_index == 4'd15)
-                        ct_index <= 4'd0;
-                    else
-                        ct_index <= ct_index + 1'b1;
-                end
-
-                default: begin
-                    // No operation.
-                end
-            endcase
-        end
-    end
-
-    // ena is part of the standard Tiny Tapeout interface. This design does
-    // not use it internally.
-    wire unused_ena = ena;
-
-endmodule
-
-
-
-module aes128_core (
-    input  wire         clk,
-    input  wire         rst_n,
-    input  wire         start,
-    input  wire [127:0] key,
-    input  wire [127:0] plaintext,
-    output reg  [127:0] ciphertext,
-    output reg          busy,
-    output reg          done
-);
-    // One shared S-box, used for both key expansion and SubBytes.
-    // Each AES round takes 4 key S-box cycles, 1 key-update cycle,
-    // 16 SubBytes/ShiftRows cycles, and 4 MixColumns/AddRoundKey cycles.
-    localparam [2:0] IDLE = 3'd0,
-                     KEY_SBOX = 3'd1,
-                     KEY_UPDATE = 3'd2,
-                     SUB_SHIFT = 3'd3,
-                     COLUMN = 3'd4;
-
-    reg [2:0] phase;
-    reg [3:0] index;
-    reg [3:0] round_num;
-    reg [127:0] state_reg;
-    reg [127:0] round_key;
-    reg [127:0] sub_state;
-    reg [31:0] gword;
 
     wire [31:0] w0 = round_key[127:96] ^ gword;
     wire [31:0] w1 = round_key[95:64] ^ w0;
@@ -158,14 +79,10 @@ module aes128_core (
     wire [31:0] w3 = round_key[31:0] ^ w2;
     wire [127:0] expanded_key = {w0, w1, w2, w3};
 
-    // Output-byte index encodes {column, row}.
-    // ShiftRows reads input from column (column + row) modulo 4.
-    wire [1:0] source_column = index[3:2] + index[1:0];
-    wire [3:0] source_index = {source_column, index[1:0]};
-
+    // SubBytes shifts the state left one byte per cycle, so the S-box always
+    // reads the top byte. Key expansion reads RotWord(w3) one byte at a time.
     reg [7:0] sbox_input;
     always @* begin
-        sbox_input = 8'h00;
         if (phase == KEY_SBOX) begin
             case (index[1:0])
                 2'd0: sbox_input = round_key[23:16];
@@ -173,11 +90,20 @@ module aes128_core (
                 2'd2: sbox_input = round_key[7:0];
                 default: sbox_input = round_key[31:24];
             endcase
-        end else if (phase == SUB_SHIFT) begin
-            sbox_input = state_reg[127 - 8*source_index -: 8];
+        end else begin
+            sbox_input = state_reg[127:120];
         end
     end
     wire [7:0] sbox_output = aes_sbox(sbox_input);
+
+    // ShiftRows: byte i = 4*column + row sits at state_reg[127-8*i -: 8].
+    // Output (column, row) takes input (column + row mod 4, row).
+    wire [127:0] shifted_state = {
+        state_reg[127:120], state_reg[87:80],   state_reg[47:40],   state_reg[7:0],
+        state_reg[95:88],   state_reg[55:48],   state_reg[15:8],    state_reg[103:96],
+        state_reg[63:56],   state_reg[23:16],   state_reg[111:104], state_reg[71:64],
+        state_reg[31:24],   state_reg[119:112], state_reg[79:72],   state_reg[39:32]
+    };
 
     function automatic [7:0] round_constant;
         input [3:0] r;
@@ -224,41 +150,50 @@ module aes128_core (
         end
     endfunction
 
-    wire [31:0] selected_column = sub_state[127 - 32*index[1:0] -: 32];
+    // The column phase rotates state_reg and round_key by one word per cycle,
+    // so the current column and round-key word are always the top word.
+    // Four rotations restore round_key for the next key expansion.
+    wire [31:0] selected_column = state_reg[127:96];
     wire [31:0] transformed_column =
         (round_num == 4'd10) ? selected_column : mix_column(selected_column);
-    wire [31:0] output_column =
-        transformed_column ^ round_key[127 - 32*index[1:0] -: 32];
+    wire [31:0] output_column = transformed_column ^ round_key[127:96];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            key_reg <= 128'd0;
+            state_reg <= 128'd0;
+            round_key <= 128'd0;
+            gword <= 32'd0;
             phase <= IDLE;
             index <= 4'd0;
             round_num <= 4'd0;
-            state_reg <= 128'd0;
-            round_key <= 128'd0;
-            sub_state <= 128'd0;
-            gword <= 32'd0;
-            ciphertext <= 128'd0;
             busy <= 1'b0;
             done <= 1'b0;
         end else begin
             done <= 1'b0;
             case (phase)
                 IDLE: begin
-                    if (start) begin
-                        state_reg <= plaintext ^ key; // initial AddRoundKey
-                        round_key <= key;
-                        round_num <= 4'd1;
-                        index <= 4'd0;
-                        busy <= 1'b1;
-                        phase <= KEY_SBOX;
-                    end
+                    case (uio_in)
+                        CMD_LOAD_KEY: key_reg <= {key_reg[119:0], ui_in};
+                        CMD_LOAD_PT:  state_reg <= {state_reg[119:0], ui_in};
+                        CMD_READ_CT:  state_reg <= {state_reg[119:0], state_reg[127:120]};
+                        CMD_START: begin
+                            state_reg <= state_reg ^ key_reg; // initial AddRoundKey
+                            round_key <= key_reg;
+                            round_num <= 4'd1;
+                            index <= 4'd0;
+                            busy <= 1'b1;
+                            phase <= KEY_SBOX;
+                        end
+                        default: begin
+                            // No operation.
+                        end
+                    endcase
                 end
                 KEY_SBOX: begin
-                    gword[31 - 8*index[1:0] -: 8] <=
-                        sbox_output ^
-                        ((index == 4'd0) ? round_constant(round_num) : 8'h00);
+                    gword <= {gword[23:0],
+                              sbox_output ^
+                              ((index == 4'd0) ? round_constant(round_num) : 8'h00)};
                     if (index == 4'd3) begin
                         index <= 4'd0;
                         phase <= KEY_UPDATE;
@@ -268,19 +203,23 @@ module aes128_core (
                 KEY_UPDATE: begin
                     round_key <= expanded_key;
                     index <= 4'd0;
-                    phase <= SUB_SHIFT;
+                    phase <= SUB_BYTES;
                 end
-                SUB_SHIFT: begin
-                    sub_state[127 - 8*index -: 8] <= sbox_output;
+                SUB_BYTES: begin
+                    state_reg <= {state_reg[119:0], sbox_output};
                     if (index == 4'd15) begin
                         index <= 4'd0;
-                        phase <= COLUMN;
+                        phase <= SHIFT_ROWS;
                     end else
                         index <= index + 1'b1;
                 end
+                SHIFT_ROWS: begin
+                    state_reg <= shifted_state;
+                    phase <= COLUMN;
+                end
                 COLUMN: begin
-                    state_reg[127 - 32*index[1:0] -: 32] <= output_column;
-                    ciphertext[127 - 32*index[1:0] -: 32] <= output_column;
+                    state_reg <= {state_reg[95:0], output_column};
+                    round_key <= {round_key[95:0], round_key[127:96]};
                     if (index == 4'd3) begin
                         index <= 4'd0;
                         if (round_num == 4'd10) begin
@@ -298,6 +237,10 @@ module aes128_core (
             endcase
         end
     end
+
+    // ena is part of the standard Tiny Tapeout interface. This design does
+    // not use it internally.
+    wire unused_ena = ena;
 
     function automatic [7:0] aes_sbox;
         input [7:0] a;
